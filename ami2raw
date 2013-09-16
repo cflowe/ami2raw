@@ -1,0 +1,168 @@
+#!/bin/bash
+#
+# usage: ami2raw <device> <fs-type> [raw-size-in-Mib]
+#
+# Size of the raw image defaults to the size of the device.
+#
+# Create a 4GiB disk image of /dev/xvdf that contains a ext4 filesystem
+# ami2raw /dev/xvdf ext4 4096
+#
+set -e
+
+prog=$(basename $0)
+
+function log
+{
+  echo -e "$(date +'%Y.%m.%d %H:%M:%S'): $@"
+}
+
+function _cleanup
+{
+  set +e
+
+  if [ -n "${newMount-}" ]; then
+    umount $newMount
+  fi
+
+  if [ -n  "${origMount:-}" ]; then
+    umount $origMount
+  fi
+
+  if [ -n "${tmpDiskImageDevice:-}" \
+    -a "${tmpDiskImageDevice:-}" != "${diskImageDevice:-}p1" ]; then
+    losetup -d $tmpDiskImageDevice
+  fi
+
+  if [ -n "${diskImageDevice:-}" ]; then
+    losetup -d $diskImageDevice
+  fi
+}
+
+if [ $# -lt 2 ]; then
+  echo "usage: $prog <device> <fs-type> [size-in-Mib]" >&2
+  exit 1
+fi
+
+device=$1
+deviceFstype=$(blkid -o export /dev/xvdf | awk -F= '/^TYPE/ {print $2}')
+
+if [ -z "$deviceFstype" ]; then
+  deviceFstype=$(file -s $device \
+    | sed -r -e 's/^.*\s([^\s]+)\s+filesystem.*/\1/')
+fi
+
+if [ -z "$deviceFstype" ]; then
+  echo "$prog: unable to determine the filesystem type of $deivce" >&2
+  exit 1
+fi
+
+if [ ! -b $device ]; then
+  echo "$prog: $device is not a block device" >&2
+  exit 1
+fi
+
+if egrep -q "^$device[[:space:]]" /proc/mounts; then
+  echo "$prog: Unmount $device first" >&2
+  exit 1
+fi
+
+newFstype=$2
+
+if [ ! -x "/sbin/mkfs.$newFstype" ]; then
+  cat >&2 <<EOF
+$prog: Filesystem type '$newFstype' is not supported
+
+The supported filesystems are:
+
+$(ls /sbin/mkfs.* | awk -F. '{print $2}' | sort)
+EOF
+
+  exit 1
+fi
+
+deviceName=$(basename $device)
+size=${3:-$(parted $device unit MiB print | awk '/^Disk/ {print $3}' | tr -d '[A-Za-z]')}
+
+#tempdir=$(mktemp --tmpdir=. "$deviceName-XXXXXXXXXX")
+tempdir=test
+
+#XXX
+mkdir -p $tempdir
+
+#volume="$tempdir/volume.raw"
+#log "Copying device content to $volume"
+#log dd if=$device of=$tempdir bs=1M
+
+diskImage="$tempdir/disk.raw"
+log "Allocating $size MiB for disk image $diskImage"
+dd if=/dev/zero of=$diskImage bs=1M count=$size
+
+diskImageDevice=$(losetup -fv $diskImage | awk '{print $NF}')
+
+trap _cleanup 0 1 2 13 15
+
+log "Creating the partition table"
+parted -a optimal $diskImageDevice \
+  unit MiB \
+  mklabel gpt \
+  mkpart primary 1 '100%' \
+  set 1 boot on \
+  print
+
+partprobe $diskImageDevice
+
+if [ -b "${diskImageDevice}p1" ]; then
+  # Some kernels are setup to create partition devices
+  tmpDiskImageDevice="${diskImageDevice}p1"
+else
+  # Create a loop back device for the first partition
+  # The first partition starts at 1Mib
+  tmpDiskImageDevice=$(losetup -fv -o 1048576 $diskImage | awk '{print $NF}')
+fi
+
+log "Creating $newFstype filesystem on $tmpDiskImageDevice"
+/sbin/mkfs.$newFstype -b 4096 $tmpDiskImageDevice
+
+case "$newFstype" in
+ext2|ext3|ext4*)
+  log "Setting the uuid and disk label"
+  tune2fs $tmpDiskImageDevice -L '/' -U "$(uuidgen)"
+  blkid $tmpDiskImageDevice
+  ;;
+esac
+
+log "Mounting the new filesystem $tmpDiskImageDevice"
+#kpartx -av $diskImageDevice
+#mount "/dev/mapper/$(basename $diskImageDevice)p1" $tempdir/new
+newMount="$tempdir/new"
+mkdir -p $newMount
+mount -t $newFstype $tmpDiskImageDevice $newMount
+
+log "Mounting the original filesystem $device"
+origMount="$tempdir/original"
+mkdir -p $origMount
+mount -t $deviceFstype $device $origMount
+
+log "Copying files"
+rsync -aAXv --devices --specials -f '. -' $origMount/ $newMount/ <<EOF
+- lost+found
+EOF
+
+log "Setting up grub"
+log "Fixing grub.conf"
+sed -i -r -e 's%\s+console=hvc[0-9]%%' $newMount/boot/grub/grub.conf
+
+log "Installing grub"
+grub --device-map=/dev/null <<EOF
+device (hd0) $diskImage
+root (hd0,0)
+setup (hd0,0)
+quit
+EOF
+
+log "Clearing device map"
+>$newMount/boot/grub/device.map
+
+log "Finished"
+
+mkdir -p "$tempdir/new/proc" "$tempdir/new/sys" "$tempdir/new/dev"
