@@ -83,15 +83,7 @@ fi
 deviceName=$(basename $device)
 size=${3:-$(parted $device unit MiB print | awk '/^Disk/ {print $3}' | tr -d '[A-Za-z]')}
 
-#tempdir=$(mktemp --tmpdir=. "$deviceName-XXXXXXXXXX")
-tempdir=test
-
-#XXX
-mkdir -p $tempdir
-
-#volume="$tempdir/volume.raw"
-#log "Copying device content to $volume"
-#log dd if=$device of=$tempdir bs=1M
+tempdir=$(mktemp --tmpdir=. "$deviceName-XXXXXXXXXX")
 
 diskImage="$tempdir/disk.raw"
 log "Allocating $size MiB for disk image $diskImage"
@@ -112,7 +104,7 @@ parted -a optimal $diskImageDevice \
 partprobe $diskImageDevice
 
 if [ -b "${diskImageDevice}p1" ]; then
-  # Some kernels are setup to create partition devices
+  # Some kernels are setup to create partition loop back devices
   tmpDiskImageDevice="${diskImageDevice}p1"
 else
   # Create a loop back device for the first partition
